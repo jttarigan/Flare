@@ -1,0 +1,13 @@
+# Claude Code local state (not for public repo)
+.claude/
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+
+# Future Flare additions
+training/data/
+training/checkpoints/
+eval/runs/
+*.onnx
+*.tflite
