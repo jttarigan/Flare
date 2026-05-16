@@ -49,23 +49,19 @@ Single source of truth for "where is the research right now". Update at the end 
 - **UBO size headroom.** GLES 3.0 guarantees `MAX_UNIFORM_BLOCK_SIZE ≥ 16 KiB`; 32 lights × 32 B = 1 KiB. Plenty.
 - **Calibration on device.** `heroLightRadius=5.5` and `heroLightColor={1.2, 1.0, 0.8}` are eyeballed. Tweak after seeing the Poco render.
 
-## Next concrete step
+## Next concrete step — device verification of 1d + Step 2
 
-**Sub-step 1d — runtime `activeLightCount` knob + HUD digit.** Closes Step 1 by making the eval sweep on-device-toggleable without a rebuild.
-1. Map an unused input gesture (e.g. triple-tap on the right HUD area, or three-finger tap anywhere — joystick owns the left half, double-tap right already does the ACSCull toggle) to cycle `activeLightCount` through 1 → 4 → 8 → 16 → 32 → 1.
-2. Add a 5th line to `renderTriCount` (or a separate 1-digit scissor block) showing the current count, so screenshots from Phase 5 sweeps are self-labelling.
-3. Sanity-check: with `activeLightCount = 0`, scene should fall back to pure ambient on both ground and characters (good regression check that the shader paths share their fallback correctly).
+The Poco was disconnected mid-session, so the last two commits are build-verified only. First task next session:
+1. Reconnect Poco X6 Pro, `cd ../ITHappyGame && ./gradlew installDebug`, capture initial logcat (`adb logcat -d -s ITHappyGame:V`) — look for `Shader compile error`, `Shadow FBO incomplete`, or `LightBlock not found` lines.
+2. Walk the player. Hero light should cast a contact shadow on the platform under the player's feet and on followers when they line up between the player and any of the seven seeded colored lights. The seven colored lights themselves stay unshadowed (full color contribution to visible casters in their range).
+3. Tap top-right corner to cycle `activeLightCount`. The green HUD digit should tick `1 → 4 → 8 → 16 → 32 → 1`.
+4. Capture a screenshot via `adb exec-out screencap -p > Flare/captures/step2.png` — Claude can read it directly.
 
-Once that lands, **Step 1 closes** and Phase 1, Step 2 (point-light cube shadow mapping) opens.
+Open issues to expect on first run:
+- **Shadow bias.** Hardcoded at `0.01` against normalized `length(fragToLight) / shadowFar`. Likely needs a pass: too low → acne, too high → floating shadows.
+- **`gl_FragDepth` precision.** Mali-G615 should be fine but flicker at shadow edges = raise to `highp` or pack depth into a color attachment.
+- **6-pass cost.** Subjective on-device. If FPS visibly drops, halve `shadowMapSize` to 256.
 
-## Later — Phase 1, Step 2
-
-**Topic:** Point-light cube shadow mapping.
-
-**Pre-reads**
-- Whatever N-light implementation lands from Step 1.
-- ES 3.0 depth cubemap path: `GL_TEXTURE_CUBE_MAP` + `GL_DEPTH_COMPONENT24` + per-face attachment (no geometry shaders in ES 3.0 → six render passes, one per cube face).
-
-**First task:** Single-light cube shadow map at fixed res (e.g. 256² × 6 faces) for one designated "hero" light, hard PCF. Then sweep light count × shadow res for the per-light/per-pixel cost curve that motivates the visibility predictor.
+After verification, **Step 3** opens: GPU timing queries (`EXT_disjoint_timer_query`) so the cost curve is measurable instead of subjective. That closes Phase 1.
 
 **Out of scope until later phases:** NPU integration, training-data generation, ONNX/TFLite/NNAPI, the user study.
