@@ -1,6 +1,9 @@
 # Claude Code local state (not for public repo)
 .claude/
 
+# Device screenshots (not for repo — bulky, ephemeral)
+captures/
+
 # OS / editor cruft
 Thumbs.db
 .DS_Store

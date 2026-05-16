@@ -5,11 +5,12 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1** — Baseline and instrumentation (week 1 of 3)
-- **Step 1** — Forward N-light shading. **Sub-steps 1a + 1b shipped to device, verified on Mali-G615 (Poco X6 Pro).** Sub-step 1c (`PLATFORM_VS/FS` per-vertex ground lighting) is next.
+- **Step 1 — Forward N-light shading: shader work complete (1a + 1b + 1c shipped to device, user-confirmed on Mali-G615 / Poco X6 Pro).** Only the runtime `activeLightCount` knob + HUD digit remains before Step 1 closes.
 - **Game-side commits (in `../ITHappyGame/`):**
   - `0934f78` — Checkpoint (pre-Flare asset refresh; retreat point).
   - `1160bea` — Flare 1a (single hero point light, 0.5× chars, dim ambient, 20% zoom).
   - `8526ba1` — Flare 1b (std140 UBO `LightBlock`, 8-light cap, deterministic colored seed scene).
+  - `5a7ad76` — Flare 1c (`PLATFORM_VS/FS` per-vertex ground lighting sharing the UBO; unlit line grid kept on `gridShader`).
 
 ## Session log
 
@@ -27,6 +28,8 @@ Single source of truth for "where is the research right now". Update at the end 
 - **Implemented sub-step 1a** (`1160bea`): single hero point light tracking the player. Replaced hardcoded directional in `SKINNED_FS` with `u_lightPos / u_lightColor / u_lightRadius / u_ambient` uniforms, quadratic falloff. Added `Game::{ambientColor, heroLightColor, heroLightRadius, heroLightYOffset}` and per-frame upload at top of `Game::render` (one upload covers chars + enemy + props since they share `shaderProgram`). Visual tweaks bundled: 0.5× character scale (with bounding box), 2× cursor offsets for wider follower spread, ambient dropped to `(0.12, 0.12, 0.14)`, camera 20% closer.
 - **Implemented sub-step 1b** (`8526ba1`): replaced sub-step 1a's per-frame `glUniform` calls with a 1056-byte std140 `LightBlock` UBO holding `ambient + lightCount + Light[32]` (interleaved `posR`, `colAtt`). One `glBufferSubData` + `glBindBufferBase` per frame; same compiled shader handles every eval sweep (1/4/8/16/32) via runtime-bounded loop on `u_lightCount.x`. Seeded 8-light Phase-1 scene: hero (slot 0, player-tracked) + 7 static colored points (R/C/G/Y/M/B/O) at y=1.5 around origin. Block index resolved via `glGetUniformBlockIndex` + `glUniformBlockBinding` (ES 3.0 has no `layout(binding=)` on uniform blocks).
 - Verified clean on Mali-G615 (Poco X6 Pro, OpenGL ES 3.2 driver r44p1): zero shader compile errors, multi-color falloff visible on characters as the player traverses the seeded scene.
+- **Implemented sub-step 1c** (`5a7ad76`): per-vertex ground lighting via new `PLATFORM_VS/FS` pair. VS runs the N-light loop with a constant `(0,1,0)` up-normal, reads the same `LightBlock` UBO as `SKINNED_FS`; FS multiplies vertex base color by the lit term. UBO upload relocated to the top of `Game::render` so both shader programs see fresh light data before any draw — one `glBindBufferBase` persists across `glUseProgram` calls. `cleanup()` extended to free `platformShader` + `lightUbo`. User-confirmed visually on device.
+- **Established device-screenshot workflow.** `adb exec-out screencap -p > Flare/captures/<name>.png` produces a PNG Claude can read directly (multimodal); `Flare/captures/` is gitignored. First attempt in session 1 returned an all-black frame because the phone screen had slept between user confirmation and capture — visual feedback worked but the assistant-loop visual check is screen-state-dependent.
 
 **Decisions recorded for posterity** (made in planning before the session)
 - UBO for lights, baseline cap 8, eval sweep 1 / 4 / 8 / 16 / 32.
@@ -43,13 +46,12 @@ Single source of truth for "where is the research right now". Update at the end 
 
 ## Next concrete step
 
-**Sub-step 1c — `PLATFORM_VS/FS` per-vertex ground lighting.** The platform is currently drawn with `gridShader` (unlit, no normals). Plan:
-1. Read `buildPlatform()` to learn the current vertex format (likely one quad per filled cell).
-2. Add a new `PLATFORM_VS/FS` shader pair. VS does the N-light loop per vertex using the SAME `LightBlock` UBO (std140 layouts match across programs), with a constant `(0,1,0)` normal. FS just `fragColor = baseCol * v_lit`.
-3. Switch the platform draw in `Game::render` to the new pair. `glUniformBlockBinding(platformProg, idx, lightBlockBinding)` once in init.
-4. Sanity-check: with `activeLightCount=0` the platform should look identical to today's unlit ambient state.
+**Sub-step 1d — runtime `activeLightCount` knob + HUD digit.** Closes Step 1 by making the eval sweep on-device-toggleable without a rebuild.
+1. Map an unused input gesture (e.g. triple-tap on the right HUD area, or three-finger tap anywhere — joystick owns the left half, double-tap right already does the ACSCull toggle) to cycle `activeLightCount` through 1 → 4 → 8 → 16 → 32 → 1.
+2. Add a 5th line to `renderTriCount` (or a separate 1-digit scissor block) showing the current count, so screenshots from Phase 5 sweeps are self-labelling.
+3. Sanity-check: with `activeLightCount = 0`, scene should fall back to pure ambient on both ground and characters (good regression check that the shader paths share their fallback correctly).
 
-Then Step 1 closes out: add a debug knob to cycle `activeLightCount` through 1 / 4 / 8 / 16 / 32 on-device (e.g. triple-tap on the HUD area), so Phase 5's sweep is data collection on the existing build.
+Once that lands, **Step 1 closes** and Phase 1, Step 2 (point-light cube shadow mapping) opens.
 
 ## Later — Phase 1, Step 2
 
