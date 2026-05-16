@@ -5,12 +5,15 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1** — Baseline and instrumentation (week 1 of 3)
-- **Step 1 — Forward N-light shading: shader work complete (1a + 1b + 1c shipped to device, user-confirmed on Mali-G615 / Poco X6 Pro).** Only the runtime `activeLightCount` knob + HUD digit remains before Step 1 closes.
+- **Step 1 closed** (all of 1a–1d shipped; 1a–1c device-confirmed, 1d build-verified pending device test).
+- **Step 2 landed in code, pending device test.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Game-side commits (in `../ITHappyGame/`):**
   - `0934f78` — Checkpoint (pre-Flare asset refresh; retreat point).
   - `1160bea` — Flare 1a (single hero point light, 0.5× chars, dim ambient, 20% zoom).
   - `8526ba1` — Flare 1b (std140 UBO `LightBlock`, 8-light cap, deterministic colored seed scene).
   - `5a7ad76` — Flare 1c (`PLATFORM_VS/FS` per-vertex ground lighting sharing the UBO; unlit line grid kept on `gridShader`).
+  - `544e6a8` — Flare 1d (top-right corner tap cycles `activeLightCount` 1/4/8/16/32; green HUD digit).
+  - `47269ea` — Flare Step 2 (512² depth cube map, 6-pass shadow caster for hero light only; SKINNED_FS + PLATFORM_VS/FS split hero from non-hero so per-fragment shadow factor cleanly attenuates only its contribution).
 
 ## Session log
 
@@ -30,6 +33,8 @@ Single source of truth for "where is the research right now". Update at the end 
 - Verified clean on Mali-G615 (Poco X6 Pro, OpenGL ES 3.2 driver r44p1): zero shader compile errors, multi-color falloff visible on characters as the player traverses the seeded scene.
 - **Implemented sub-step 1c** (`5a7ad76`): per-vertex ground lighting via new `PLATFORM_VS/FS` pair. VS runs the N-light loop with a constant `(0,1,0)` up-normal, reads the same `LightBlock` UBO as `SKINNED_FS`; FS multiplies vertex base color by the lit term. UBO upload relocated to the top of `Game::render` so both shader programs see fresh light data before any draw — one `glBindBufferBase` persists across `glUseProgram` calls. `cleanup()` extended to free `platformShader` + `lightUbo`. User-confirmed visually on device.
 - **Established device-screenshot workflow.** `adb exec-out screencap -p > Flare/captures/<name>.png` produces a PNG Claude can read directly (multimodal); `Flare/captures/` is gitignored. First attempt in session 1 returned an all-black frame because the phone screen had slept between user confirmation and capture — visual feedback worked but the assistant-loop visual check is screen-state-dependent.
+- **Implemented sub-step 1d** (`544e6a8`): top-right corner tap (x > 0.75·W, y < 0.25·H) cycles `activeLightCount` through `1 → 4 → 8 → 16 → 32 → 1` — the exact Phase-5 eval sweep order, so the sweep becomes data collection on the same APK without per-count rebuilds. New `renderLightCount` adds a green 5th HUD line below the four tri-count lines so screenshots are self-labelling. Build-verified; **not yet device-tested** (Poco disconnected).
+- **Implemented Step 2** (`47269ea`): point-light cube shadow mapping for the hero light only. 512² `GL_DEPTH_COMPONENT24` cube map + 6-pass depth-only pre-pass via new `shadowCastShader` (shares SKINNED_VS layout/skinning). Cast set = chars + enemy + props; platform doesn't cast (only ground in scene). `SHADOW_CAST_FS` writes linear distance / `shadowFar` to `gl_FragDepth` so the receiver compares distances directly — no per-face unprojection. `SKINNED_FS` and `PLATFORM_VS/FS` split hero from non-hero lights so the per-fragment shadow factor only attenuates the hero's contribution; the seven colored seed lights stay unshadowed (Phase-1 scope decision). Build-verified for both ABIs; **not yet device-tested**.
 
 **Decisions recorded for posterity** (made in planning before the session)
 - UBO for lights, baseline cap 8, eval sweep 1 / 4 / 8 / 16 / 32.
