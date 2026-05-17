@@ -4,9 +4,12 @@ Single source of truth for "where is the research right now". Update at the end 
 
 ## Current position
 
-- **Phase 1** — Baseline and instrumentation (week 1 of 3)
-- **Step 1 closed** (all of 1a–1d shipped; 1a–1c device-confirmed, 1d build-verified pending device test).
-- **Step 2 landed in code, pending device test.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
+- **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
+- **Step 1 closed and device-verified** (1a–1d).
+- **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
+- **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
+- **Phase 1 baseline numbers (Poco, 8 active lights, hero shadow on):** shadow_cast ≈ 5.9 ms, platform ≈ 2.0 ms, skinned ≈ 3.2 ms, sum ≈ 11.2 ms. Shadow pre-pass dominates — confirms the Phase-3 learned visibility predictor (contribution #2) is the right target.
+- **Phase 2 next: training-data generation.** Decoupled from `ITHappyGame/` — lives under `Flare/training/` (not yet created).
 - **Game-side commits (in `../ITHappyGame/`):**
   - `0934f78` — Checkpoint (pre-Flare asset refresh; retreat point).
   - `1160bea` — Flare 1a (single hero point light, 0.5× chars, dim ambient, 20% zoom).
@@ -14,6 +17,7 @@ Single source of truth for "where is the research right now". Update at the end 
   - `5a7ad76` — Flare 1c (`PLATFORM_VS/FS` per-vertex ground lighting sharing the UBO; unlit line grid kept on `gridShader`).
   - `544e6a8` — Flare 1d (top-right corner tap cycles `activeLightCount` 1/4/8/16/32; green HUD digit).
   - `47269ea` — Flare Step 2 (512² depth cube map, 6-pass shadow caster for hero light only; SKINNED_FS + PLATFORM_VS/FS split hero from non-hero so per-fragment shadow factor cleanly attenuates only its contribution).
+  - `ebdf549` — Flare Step 3 (`EXT_disjoint_timer_query` with 4-slot ring, 3 stages, cyan µs HUD). Probe via `eglGetProcAddress` + smoke test, not the extension string (Mali quirk).
 
 ## Session log
 
@@ -49,19 +53,30 @@ Single source of truth for "where is the research right now". Update at the end 
 - **UBO size headroom.** GLES 3.0 guarantees `MAX_UNIFORM_BLOCK_SIZE ≥ 16 KiB`; 32 lights × 32 B = 1 KiB. Plenty.
 - **Calibration on device.** `heroLightRadius=5.5` and `heroLightColor={1.2, 1.0, 0.8}` are eyeballed. Tweak after seeing the Poco render.
 
-## Next concrete step — device verification of 1d + Step 2
+### Session 2 — 2026-05-17
 
-The Poco was disconnected mid-session, so the last two commits are build-verified only. First task next session:
-1. Reconnect Poco X6 Pro, `cd ../ITHappyGame && ./gradlew installDebug`, capture initial logcat (`adb logcat -d -s ITHappyGame:V`) — look for `Shader compile error`, `Shadow FBO incomplete`, or `LightBlock not found` lines.
-2. Walk the player. Hero light should cast a contact shadow on the platform under the player's feet and on followers when they line up between the player and any of the seven seeded colored lights. The seven colored lights themselves stay unshadowed (full color contribution to visible casters in their range).
-3. Tap top-right corner to cycle `activeLightCount`. The green HUD digit should tick `1 → 4 → 8 → 16 → 32 → 1`.
-4. Capture a screenshot via `adb exec-out screencap -p > Flare/captures/step2.png` — Claude can read it directly.
+**Done**
+- Reconnected Poco X6 Pro, `installDebug` from `Flare/`. Clean boot: GL Vendor ARM, Mali-G615 MC6, ES 3.2 r44p1. No `Shader compile error`, no `Shadow FBO incomplete`, no `LightBlock not found`.
+- Walked the player. Hero contact shadow renders correctly on the platform under the cluster, shape morphs per-pose so the cube map is being sampled live. No acne, no detachment — bias 0.01 holds at this scale.
+- Top-right corner tap cycled the green HUD digit through the sweep (`8 → 16 → 32 …`). Scene is visually identical past 8 (only 8 lights seeded; extra iterations are zero-contribution loops, which is exactly what the GPU-cost eval will measure).
+- Captures: `Flare/captures/step2_first.png` (default 8 lights, hero shadow visible) and `Flare/captures/step2_cycle1.png` (HUD at 32).
+- **Step 1d and Step 2 are now device-verified.** Phase-1 baseline closes after Step 3 (GPU timing).
+- **Implemented Step 3** (`ebdf549`): `EXT_disjoint_timer_query` with a 4-slot ring × 3 stages (shadow_cast / platform / skinned). Cyan 7-segment µs HUD below the green light-count digit, plus a 4th sum line. `GL_GPU_DISJOINT_EXT` guard skips stale results during thermal events.
+- **Mali quirk discovered.** First attempt used `glGetString(GL_EXTENSIONS)` / `glGetStringi` — neither lists `GL_EXT_disjoint_timer_query` on r44p1 (110 extensions enumerated, none match). But `eglGetProcAddress("glGenQueriesEXT")` returns a valid pointer, the smoke test `fGenQueriesEXT(1, &probe)` succeeds with `glGetError == GL_NO_ERROR`, and queries return real µs numbers. **Fix: skip the extension string entirely, probe via `eglGetProcAddress` + a runtime smoke test.** Worth remembering for the other test devices — Mali drivers will likely repeat this trick for other extensions too.
+- **Phase 1 baseline measured.** Poco X6 Pro, 8 active lights, hero shadow on, idle scene: shadow_cast 5910 µs, platform 1999 µs, skinned 3237 µs, sum 11208 µs. Shadow pre-pass is 53% of GPU lighting work — confirms learned visibility predictor (Phase 3 contribution #2) targets the right cost center. Capture: `Flare/captures/step3_timers.png`.
 
-Open issues to expect on first run:
-- **Shadow bias.** Hardcoded at `0.01` against normalized `length(fragToLight) / shadowFar`. Likely needs a pass: too low → acne, too high → floating shadows.
-- **`gl_FragDepth` precision.** Mali-G615 should be fine but flicker at shadow edges = raise to `highp` or pack depth into a color attachment.
-- **6-pass cost.** Subjective on-device. If FPS visibly drops, halve `shadowMapSize` to 256.
+## Next concrete step — Phase 2 kickoff: training-data pipeline design
 
-After verification, **Step 3** opens: GPU timing queries (`EXT_disjoint_timer_query`) so the cost curve is measurable instead of subjective. That closes Phase 1.
+Phase 1 closed. Phase 2 (2 weeks) is **data generation**: produce the (scene, light_set) → (visibility_per_fragment) and (scene, light_set) → (light_field_grid) training datasets that the Phase-3 NPU models learn from.
 
-**Out of scope until later phases:** NPU integration, training-data generation, ONNX/TFLite/NNAPI, the user study.
+**Open design questions to settle before any code:**
+
+1. **Sampling strategy.** Random scenes vs. replay of real gameplay traces? Replay gives realistic light distributions but couples training to the game's current behavior. Random gives coverage but may oversample unlikely configurations. Recommend a *mix*: 70% replay (recorded from instrumented APK runs) + 30% randomized perturbations of replayed scenes.
+2. **Ground-truth format for visibility.** Per-fragment shadow factor `[0,1]` from the cube-shadow sampler? Or per-light visibility from the player's POV? Affects model input/output shape decisively.
+3. **Scene encoding.** What does the model see as input? Voxel grid? Bone positions + light list? Camera-space depth + light list? Decision drives the encoder architecture.
+4. **Storage budget.** A single 1080p frame's per-fragment shadow GT is 2 MB raw. At 30 FPS × 1 minute × 100 sessions = 360 GB. Need lossy compression or per-frame subsampling.
+5. **Where data lives.** `Flare/training/data/` (gitignored)? External S3? Local NAS? Persistence story matters because re-running data gen is expensive.
+
+**Concrete first task next session:** write a 1-page design doc covering 1–5, agree on the answers, *then* start the instrumentation pass on `ITHappyGame/` to dump (scene, light_set, GT) tuples per frame. The dump format will live forever — get it right before generating gigabytes.
+
+**Out of scope until later phases:** model architecture (Phase 3), NNAPI/TFLite (Phase 4), user study (Phase 6), paper (Phase 7).
