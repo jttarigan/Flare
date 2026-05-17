@@ -5,6 +5,7 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
+- **Phase 2 — started 2026-05-18.** Step 1 (FlareLab desktop port) shipped and runs the same scene on RTX 4060 Ti. Step 2 (scripted replay) next.
 - **Step 1 closed and device-verified** (1a–1d).
 - **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
@@ -18,6 +19,10 @@ Single source of truth for "where is the research right now". Update at the end 
   - `544e6a8` — Flare 1d (top-right corner tap cycles `activeLightCount` 1/4/8/16/32; green HUD digit).
   - `47269ea` — Flare Step 2 (512² depth cube map, 6-pass shadow caster for hero light only; SKINNED_FS + PLATFORM_VS/FS split hero from non-hero so per-fragment shadow factor cleanly attenuates only its contribution).
   - `ebdf549` — Flare Step 3 (`EXT_disjoint_timer_query` with 4-slot ring, 3 stages, cyan µs HUD). Probe via `eglGetProcAddress` + smoke test, not the extension string (Mali quirk).
+  - `15b8170` — Add `platform.h` shim (FlareLab enabler). Android build bit-identical; on desktop, shim provides AAssetManager/AAsset over fopen + GLEW in place of GLES3 headers.
+
+- **FlareLab/ commits** (separate local repo, sibling to `ITHappyGame/`):
+  - initial commit — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
 
 ## Session log
 
@@ -65,9 +70,42 @@ Single source of truth for "where is the research right now". Update at the end 
 - **Mali quirk discovered.** First attempt used `glGetString(GL_EXTENSIONS)` / `glGetStringi` — neither lists `GL_EXT_disjoint_timer_query` on r44p1 (110 extensions enumerated, none match). But `eglGetProcAddress("glGenQueriesEXT")` returns a valid pointer, the smoke test `fGenQueriesEXT(1, &probe)` succeeds with `glGetError == GL_NO_ERROR`, and queries return real µs numbers. **Fix: skip the extension string entirely, probe via `eglGetProcAddress` + a runtime smoke test.** Worth remembering for the other test devices — Mali drivers will likely repeat this trick for other extensions too.
 - **Phase 1 baseline measured.** Poco X6 Pro, 8 active lights, hero shadow on, idle scene: shadow_cast 5910 µs, platform 1999 µs, skinned 3237 µs, sum 11208 µs. Shadow pre-pass is 53% of GPU lighting work — confirms learned visibility predictor (Phase 3 contribution #2) targets the right cost center. Capture: `Flare/captures/step3_timers.png`.
 
-## Next concrete step — Phase 2 kickoff: training-data pipeline design
+### Session 3 — 2026-05-18
 
-Phase 1 closed. Phase 2 (2 weeks) is **data generation**: produce the (scene, light_set) → (visibility_per_fragment) and (scene, light_set) → (light_field_grid) training datasets that the Phase-3 NPU models learn from.
+**Done**
+- **Phase 2 design pass.** Wrote `Flare/training/DATA_SPEC.md` v0.1 (mobile-capture + Mali GT), then revised to v0.2 (desktop port + higher-quality desktop-rendered GT) after user pushback. v0.2 splits the two roles: **paper baseline** = frozen Phase-1 Mali shadow at 5.9 ms; **training GT** = higher-quality (4096² PCF) shadow rendered on the desktop port. Paper claim shifts from "match Mali quality, cheaper" to "deliver cleaner shadows than the Mali baseline at NPU cost."
+- **Mali extension quirk saved to memory.** Driver omits `GL_EXT_disjoint_timer_query` from `glGetString` but `eglGetProcAddress` works. New `project_flare_mali_extension_quirk` memory + MEMORY.md entry so future device-matrix debugging short-circuits.
+- **`platform.h` shim landed in `ITHappyGame/`** (`15b8170`). Tiny header that on Android is a forwarder to the existing Android API + GLES3 headers (mobile build unchanged), and on desktop provides `LOGI`/`LOGE` over stderr + an `AAssetManager`/`AAsset` reimpl over `fopen` + `<GL/glew.h>` in place of `<GLES3/gl3.h>`. `game.cpp`, `gltf_model.cpp`, `game.h`, `gltf_model.h` all now include `"platform.h"` instead of Android-specific headers directly. Android `assembleDebug` verified clean.
+- **FlareLab/ desktop port stood up** (sibling to `ITHappyGame/`, separate local git repo). CMakeLists with FetchContent for GLFW 3.4 + glew-cmake 2.2.0 (needed `CMAKE_POLICY_VERSION_MINIMUM=3.5` for CMake 4.x compatibility). `main.cpp` opens GLFW window + GL 3.3 core context, calls `glewInit`, and runs the same `Game` lifecycle (init → loop → cleanup). `platform_desktop.cpp` implements the `AAssetManager` shim against `ITHappyGame/app/src/main/assets/` (path resolved at configure time via `FLARE_ASSET_BASE_DIR`). Touch events synthesized from mouse so `Game::onTouchDown/Move/Up` reach the gameplay layer unchanged.
+- **First successful FlareLab run on RTX 4060 Ti.** All 5 GLBs loaded, animations parsed, map.bin read, scene renders at 1280×720 visually identical to the Poco baseline. NVIDIA accepts `#version 300 es` shaders on desktop GL out of the box — formal GLES→GL shader prelude swap deferred until AMD/Intel testing matters.
+
+## Next concrete step — FlareLab Phase 2 step 2: scripted input record + replay
+
+`FlareLab/` runs the scene but is currently mouse-driven only. Phase 2 capture needs **deterministic** input playback so a session can be re-recorded with the same scene state frame-for-frame after any code change (shader edit, GT-renderer swap, etc.).
+
+**Design sketch:**
+- **Recording mode** (`--record session_001.bin`): every touch event (down/move/up) gets timestamped (relative to session start) and appended to a flat binary log. End on window-close or 2-minute timer.
+- **Replay mode** (`--replay session_001.bin`): drive `Game::onTouchDown/Move/Up` from the log instead of from real mouse events. Same `dt` clock. Window stays open so the user can watch.
+- **Determinism caveat:** `Game::update` consumes a `dt` float each frame. To get bit-identical playback across runs, replay mode should also force a fixed `dt` (say, 1/60 s) instead of using `glfwGetTime()` — wall-clock variance leaks into character positions otherwise. Worth doing now; cheaper than discovering non-determinism mid-Phase-3.
+
+**Files this touches:**
+- `FlareLab/src/main.cpp` — argument parsing + replay event pump.
+- `FlareLab/src/input_log.{h,cpp}` (new) — record / replay state machines, binary I/O against a simple `(timestamp, type, id, x, y)` log format.
+
+**Out of scope this step:** capture mode (step 3) and high-quality GT renderer (step 4). Replay must work cleanly before either lands.
+
+**Phase 2 remaining steps after this** (per DATA_SPEC §"Concrete sequence after sign-off"):
+- step 3: capture mode (every-4th-frame `Sample` dump to `samples.zst`).
+- step 4: 4096² PCF cube-shadow GT renderer.
+- step 5: record 5 input sessions + run capture + compress.
+
+**Out of scope until later phases:** model architecture (Phase 3), NNAPI/TFLite (Phase 4), eval harness (Phase 5), user study (Phase 6), paper (Phase 7).
+
+---
+
+## Phase 2 kickoff archive (historical, kept for context)
+
+Phase 2 (2 weeks) is **data generation**: produce the (scene, light_set) → (visibility_per_fragment) and (scene, light_set) → (light_field_grid) training datasets that the Phase-3 NPU models learn from.
 
 **Open design questions to settle before any code:**
 
