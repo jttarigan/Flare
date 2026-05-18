@@ -5,7 +5,7 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
-- **Phase 2 — started 2026-05-18.** Step 1 (FlareLab desktop port) shipped and runs the same scene on RTX 4060 Ti. Step 2 (scripted replay) next.
+- **Phase 2 — started 2026-05-18.** Steps 1 and 2 closed and verified. Step 3 (capture mode) next.
 - **Step 1 closed and device-verified** (1a–1d).
 - **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
@@ -22,7 +22,8 @@ Single source of truth for "where is the research right now". Update at the end 
   - `15b8170` — Add `platform.h` shim (FlareLab enabler). Android build bit-identical; on desktop, shim provides AAssetManager/AAsset over fopen + GLEW in place of GLES3 headers.
 
 - **FlareLab/ commits** (separate local repo, sibling to `ITHappyGame/`):
-  - initial commit — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
+  - `0b4007a` — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
+  - `00ef870` — Phase 2 step 2 scripted input record + replay. `--record <path>` / `--replay <path>` CLI; 14-byte/event binary log (u32 frame, u8 type, u8 id, f32 x, f32 y) written field-by-field. Replay forces dt=1/60, non-resizable window, 2 s grace after last event. Verified: 1055-event session replayed faithfully.
 
 ## Session log
 
@@ -78,24 +79,21 @@ Single source of truth for "where is the research right now". Update at the end 
 - **`platform.h` shim landed in `ITHappyGame/`** (`15b8170`). Tiny header that on Android is a forwarder to the existing Android API + GLES3 headers (mobile build unchanged), and on desktop provides `LOGI`/`LOGE` over stderr + an `AAssetManager`/`AAsset` reimpl over `fopen` + `<GL/glew.h>` in place of `<GLES3/gl3.h>`. `game.cpp`, `gltf_model.cpp`, `game.h`, `gltf_model.h` all now include `"platform.h"` instead of Android-specific headers directly. Android `assembleDebug` verified clean.
 - **FlareLab/ desktop port stood up** (sibling to `ITHappyGame/`, separate local git repo). CMakeLists with FetchContent for GLFW 3.4 + glew-cmake 2.2.0 (needed `CMAKE_POLICY_VERSION_MINIMUM=3.5` for CMake 4.x compatibility). `main.cpp` opens GLFW window + GL 3.3 core context, calls `glewInit`, and runs the same `Game` lifecycle (init → loop → cleanup). `platform_desktop.cpp` implements the `AAssetManager` shim against `ITHappyGame/app/src/main/assets/` (path resolved at configure time via `FLARE_ASSET_BASE_DIR`). Touch events synthesized from mouse so `Game::onTouchDown/Move/Up` reach the gameplay layer unchanged.
 - **First successful FlareLab run on RTX 4060 Ti.** All 5 GLBs loaded, animations parsed, map.bin read, scene renders at 1280×720 visually identical to the Poco baseline. NVIDIA accepts `#version 300 es` shaders on desktop GL out of the box — formal GLES→GL shader prelude swap deferred until AMD/Intel testing matters.
+- **FlareLab Step 2 — scripted input record + replay** (`00ef870`). New `src/input_log.{h,cpp}`: `RecordSink` (append-only file) + `ReplaySource` (load-once, drain-per-frame). 14-byte/event format written field-by-field to dodge struct padding. `main.cpp` extended with `Mode::{Live,Record,Replay}` and `--record` / `--replay` CLI flags. Replay forces dt = 1/60 s, makes the window non-resizable so logged pixel coords stay valid, and auto-exits 2 s (120 frames @ 60 Hz) after the last event. Verified end-to-end: 1055-event session captured → replayed → playback visually faithful to recording.
 
-## Next concrete step — FlareLab Phase 2 step 2: scripted input record + replay
+## Next concrete step — FlareLab Phase 2 step 3: capture mode (Sample dump)
 
-`FlareLab/` runs the scene but is currently mouse-driven only. Phase 2 capture needs **deterministic** input playback so a session can be re-recorded with the same scene state frame-for-frame after any code change (shader edit, GT-renderer swap, etc.).
+With record/replay closed, the next step is the **capture pipeline**: a `--capture` flag that, while replaying (or live-running) a session, writes `Sample` structs to disk on a sub-sampled cadence. Per DATA_SPEC v0.2 this is every 4th frame, dumped as length-prefixed records into `samples.zst` (zstd-streamed). The Sample's exact field layout is the next design decision — minimally: camera transform, light list, per-fragment GT shadow (rendered by the high-quality renderer landing in step 4), and a frame index.
 
-**Design sketch:**
-- **Recording mode** (`--record session_001.bin`): every touch event (down/move/up) gets timestamped (relative to session start) and appended to a flat binary log. End on window-close or 2-minute timer.
-- **Replay mode** (`--replay session_001.bin`): drive `Game::onTouchDown/Move/Up` from the log instead of from real mouse events. Same `dt` clock. Window stays open so the user can watch.
-- **Determinism caveat:** `Game::update` consumes a `dt` float each frame. To get bit-identical playback across runs, replay mode should also force a fixed `dt` (say, 1/60 s) instead of using `glfwGetTime()` — wall-clock variance leaks into character positions otherwise. Worth doing now; cheaper than discovering non-determinism mid-Phase-3.
+**Design questions to resolve before code:**
+- **Sample schema.** Fixed-size header + variable payload? Cap light count at 32? Quantize the GT shadow buffer (2 MB raw → ~100 KB at 8-bit + zstd)?
+- **Cadence.** Every 4th frame is a starting heuristic; should it be tunable per-session?
+- **Where capture sits relative to replay.** `--replay X --capture Y` (replay drives input, capture dumps samples) is the obvious wiring. Confirm no surprises in the main-loop ordering.
 
-**Files this touches:**
-- `FlareLab/src/main.cpp` — argument parsing + replay event pump.
-- `FlareLab/src/input_log.{h,cpp}` (new) — record / replay state machines, binary I/O against a simple `(timestamp, type, id, x, y)` log format.
+I'll write a tight design doc in chat before any code, per the plan-before-implement rule.
 
-**Out of scope this step:** capture mode (step 3) and high-quality GT renderer (step 4). Replay must work cleanly before either lands.
-
-**Phase 2 remaining steps after this** (per DATA_SPEC §"Concrete sequence after sign-off"):
-- step 3: capture mode (every-4th-frame `Sample` dump to `samples.zst`).
+**Phase 2 remaining steps:**
+- step 3 (next): capture mode (Sample dump every Nth frame).
 - step 4: 4096² PCF cube-shadow GT renderer.
 - step 5: record 5 input sessions + run capture + compress.
 
