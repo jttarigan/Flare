@@ -5,7 +5,7 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
-- **Phase 2 — started 2026-05-18.** Steps 1, 2, and 3 closed and verified. Step 4 (4096² PCF GT renderer) next.
+- **Phase 2 — started 2026-05-18.** Steps 1, 2, 3, and 4 closed and verified. Step 5 (record 5 sessions + run capture + zstd-compress) next.
 - **Step 1 closed and device-verified** (1a–1d).
 - **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
@@ -25,6 +25,7 @@ Single source of truth for "where is the research right now". Update at the end 
   - `0b4007a` — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
   - `00ef870` — Phase 2 step 2 scripted input record + replay. `--record <path>` / `--replay <path>` CLI; 14-byte/event binary log (u32 frame, u8 type, u8 id, f32 x, f32 y) written field-by-field. Replay forces dt=1/60, non-resizable window, 2 s grace after last event. Verified: 1055-event session replayed faithfully.
   - `0b07403` — Phase 2 step 3 capture mode. `--capture <path>` writes one 263336-byte Sample (DATA_SPEC v0.2 wire format) every 4th frame. 256² depth captured via `glBlitFramebuffer` from default FBO → 256² capture FBO → readback → hand-rolled f32→f16. Shadow factor is placeholder zeros until step 4. Smoke test: 38 samples × 263336 B exactly.
+  - `608f341` — Phase 2 step 4 PCF shadow GT resolver. New `src/pcf_resolver.{h,cpp}`: 256² R16F FBO + full-screen-quad GLSL doing 16-sample Poisson disk PCF over `Game::hqShadowCubeTex`. Reconstructs world pos from captured depth via inverse VP. SampleWriter swaps step-3's placeholder zeros for real PCF. `main.cpp` gates `wantsHqShadow` on capture cadence so HQ cast only fires on actual sample frames.
 
 ## Session log
 
@@ -90,22 +91,37 @@ Single source of truth for "where is the research right now". Update at the end 
 - **DATA_SPEC.md fixed**: wire-format size note corrected from 264960 B → 263336 B (the 264960 was a math error; field-by-field correctly sums to 168 + 1024 + 131072 + 131072).
 - **Smoke test passed end-to-end.** Synthetic 2-event replay log (tiny.bin, 28 B) → flarelab.exe `--replay tiny.bin --capture samples_smoke.bin` → 38 samples × 263336 B = 10006768 B exactly, zero remainder. Header fields parse back: `frame_index=0`, UUID matches startup log, view/proj diag matches m4_perspective, `hero_light_pos=(0.05, 1.5, 0)` (player just started moving), `active_light_count=8`, light[0] = warm hero light, light[1] = first seeded colored light. Depth is 95% non-zero bytes (real geometry); shadow_factor is all zeros (placeholder).
 
-## Next concrete step — FlareLab Phase 2 step 4: 4096² PCF cube-shadow GT renderer
+### Session 5 — 2026-05-19
 
-The capture pipeline writes `shadow_factor` as placeholder zeros today (step 3). Step 4 fills that field with the high-quality ground truth the Phase-3 visibility predictor learns to imitate. Per DATA_SPEC §2: **4096² depth cube map + 16-sample PCF**, captured as a per-fragment shadow factor in [0,1], downsampled to 256² f16 for storage.
+**Done**
+- **FlareLab Step 4 — PCF shadow GT resolver** (`FlareLab@608f341`, `ITHappyGame@20256b9`). Splits work across both repos: `ITHappyGame/` refactors the 6-face cube-cast loop into `Game::castShadowCube(fbo, cubeTex, size)` and adds an opt-in 4096² path (`hqShadowFbo`, `hqShadowCubeTex`, `wantsHqShadow`) that runs *outside* the shadow_cast timer query so the Phase-1 baseline numbers stay clean. `FlareLab/` adds `pcf_resolver.{h,cpp}`: 256² R16F FBO + full-screen-quad fragment shader doing 16-sample Poisson disk PCF over the HQ cube. World position reconstructed from captured depth via inverse VP. Output convention matches `SKINNED_FS::shadowFactor` (1 = lit, 0 = shadowed).
+- **`wantsHqShadow` gated to capture cadence.** `main.cpp` sets `g_game.wantsHqShadow = g_captureEnabled && (g_frameIdx % CADENCE == 0)`, so the 4096² cube cast only fires on actual capture frames. Roughly 1/4 of frames pay the ~2 ms HQ cost.
+- **GL 3.3 readback quirk.** `glReadPixels(GL_RED, GL_HALF_FLOAT)` from an R16F FBO is rejected on NVIDIA desktop drivers (GL_INVALID_VALUE) even though the spec allows the implementation-color-read-type to be GL_HALF_FLOAT. Workaround: read as `GL_FLOAT` and pack to f16 in CPU. 256 KB CPU memory + ~5 lines of IEEE conversion; reliable across vendors.
+- **GL error queue caveat.** Game::render leaves benign errors in the queue on this driver — initial PCF debugging chased phantom 0x501s that were actually stale. Fix: `while (glGetError()) {}` drain at the top of `resolve_and_readback` so the final check only catches real PCF errors.
+- **Smoke test passed.** Re-ran the tiny.bin replay with `--capture samples_step4.bin`: 38 samples × 263336 B, shadow distribution bimodal (60923 fully-lit + 3056 fully-shadowed + 1557 PCF-penumbra pixels per frame). PNG dumps at `Flare/captures/step4_shadow_sample{005,015,030}.png` show recognizable top-down silhouettes of the 4 chars + boss-robot enemy with soft PCF edges on the lit platform — the GT looks like real ground truth.
+- **DATA_SPEC math fix** (already in `Flare@d52b977`): wire-format size annotation 264960 → 263336.
 
-**Design questions to resolve before code:**
-- **Render-graph placement.** Existing Phase-1 cube-shadow runs at 512² inside `Game::render`. Cleanest is a *second* cube-shadow path that only fires on capture frames (`g_frameIdx % 4 == 0`), uses a 4096² FBO, and writes its sampled per-fragment factor into a 256² FBO that SampleWriter reads back. The Phase-1 512² path stays untouched so the Mali baseline cost numbers don't shift.
-- **PCF kernel choice.** 16-sample stratified Poisson disk vs. fixed 4×4 grid vs. learned sampling pattern? Poisson disk is the conventional pick; 4×4 grid is cheaper but more banding-prone. Probably Poisson.
-- **Where the shadow_factor pass renders.** Need a third FBO sized 256×256 (RGBA8 or R8) that runs a full-screen quad over the captured 256² depth + light list and writes shadow factor per texel. Or: render at the native 1280×720 resolution and downsample (like the depth path).
-- **Cost.** 4096² is 64× the per-face area of the Phase-1 512² map; 6 faces × 4096² is 100M pixels per capture frame. On RTX 4060 Ti this is ~2 ms — fine for offline GT generation, not realtime.
+## Next concrete step — FlareLab Phase 2 step 5: record sessions + run capture + zstd-compress
 
-**Files this will touch:**
-- `ITHappyGame/app/src/main/cpp/game.cpp` and `.h` — likely a new opt-in path or a separate renderer class living next to `Game` (TBD in design).
-- `FlareLab/src/sample_writer.cpp` — call into the high-quality shadow path, read back 256² shadow factor, replace the zeros in the Sample.
+With steps 1–4 closed, the dump pipeline is feature-complete. Step 5 turns it into actual training data:
 
-**Phase 2 remaining steps after this:**
-- step 5: record 5 input sessions + run capture + zstd-compress (`samples.bin` → `samples.zst`, manifest.json).
+1. **Record 5 input sessions** with FlareLab `--record`, following the DATA_SPEC §1 menu:
+   - Idle (cursor stationary)
+   - Slow movement (cursor walks platform)
+   - Full chase (cursor runs perimeter)
+   - Attack scrum (cursor sits on enemy)
+   - Large empty area (cursor at platform edge)
+   Each ~2 min target → ~7200 frames @ 60 Hz → ~1800 samples each. Files: `FlareLab/sessions/session_{01..05}_<tag>.bin`.
+
+2. **Run capture against each session** → per-session `samples.bin` (~145 MB raw, ~470 MB total per DATA_SPEC §4).
+
+3. **Compress to zstd** + write `manifest.json` per session. Open question: do this with the existing `zstd` CLI (post-process, simple) or fold zstd-streaming into `SampleWriter` (slightly more code, but tighter pipeline)? Recommend CLI post-process for step 5 unless capture-time disk space is a problem.
+
+4. **Land artifacts under `Flare/training/data/<session>/`** (gitignored per DATA_SPEC §5): `samples.zst` + `meta.json` (capture date, FlareLab + ITHappyGame SHAs, GT settings).
+
+**Phase 2 closes** when all 5 session datasets exist. Total corpus ~725 MB compressed.
+
+**Phase 3 begins** with model architecture design (visibility predictor U-Net or similar, trained against Dataset V).
 
 **Out of scope until later phases:** model architecture (Phase 3), NNAPI/TFLite (Phase 4), eval harness (Phase 5), user study (Phase 6), paper (Phase 7).
 
