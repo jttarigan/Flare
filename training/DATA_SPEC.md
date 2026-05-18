@@ -112,18 +112,19 @@ Flare/training/
 ## Wire format (unchanged from v0.1)
 
 ```
-struct Sample {           // little-endian, packed, fixed size 264960 bytes
-  uint64  frame_index;
-  uint64  session_uuid_low;
-  uint64  session_uuid_high;
-  float32 camera_view[16];
-  float32 camera_proj[16];
-  float32 hero_light_pos[3];
-  uint32  active_light_count;
-  Light   light_list[32];                  // 1024 B
+struct Sample {           // little-endian, packed, fixed size 263336 bytes
+  uint64  frame_index;                      //      8
+  uint64  session_uuid_low;                 //      8
+  uint64  session_uuid_high;                //      8
+  float32 camera_view[16];                  //     64
+  float32 camera_proj[16];                  //     64
+  float32 hero_light_pos[3];                //     12
+  uint32  active_light_count;               //      4
+  Light   light_list[32];                   //   1024 B
   float16 depth[256 * 256];                 // 131072 B
   float16 shadow_factor[256 * 256];         // 131072 B (PCF GT, captured on desktop)
 }
+// Total: 168 (header) + 1024 + 131072 + 131072 = 263336 B
 struct Light {
   float32 pos[3];
   float32 radius;

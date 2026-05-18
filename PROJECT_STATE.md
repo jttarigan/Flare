@@ -5,7 +5,7 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
-- **Phase 2 — started 2026-05-18.** Steps 1 and 2 closed and verified. Step 3 (capture mode) next.
+- **Phase 2 — started 2026-05-18.** Steps 1, 2, and 3 closed and verified. Step 4 (4096² PCF GT renderer) next.
 - **Step 1 closed and device-verified** (1a–1d).
 - **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
@@ -24,6 +24,7 @@ Single source of truth for "where is the research right now". Update at the end 
 - **FlareLab/ commits** (separate local repo, sibling to `ITHappyGame/`):
   - `0b4007a` — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
   - `00ef870` — Phase 2 step 2 scripted input record + replay. `--record <path>` / `--replay <path>` CLI; 14-byte/event binary log (u32 frame, u8 type, u8 id, f32 x, f32 y) written field-by-field. Replay forces dt=1/60, non-resizable window, 2 s grace after last event. Verified: 1055-event session replayed faithfully.
+  - `0b07403` — Phase 2 step 3 capture mode. `--capture <path>` writes one 263336-byte Sample (DATA_SPEC v0.2 wire format) every 4th frame. 256² depth captured via `glBlitFramebuffer` from default FBO → 256² capture FBO → readback → hand-rolled f32→f16. Shadow factor is placeholder zeros until step 4. Smoke test: 38 samples × 263336 B exactly.
 
 ## Session log
 
@@ -81,21 +82,30 @@ Single source of truth for "where is the research right now". Update at the end 
 - **First successful FlareLab run on RTX 4060 Ti.** All 5 GLBs loaded, animations parsed, map.bin read, scene renders at 1280×720 visually identical to the Poco baseline. NVIDIA accepts `#version 300 es` shaders on desktop GL out of the box — formal GLES→GL shader prelude swap deferred until AMD/Intel testing matters.
 - **FlareLab Step 2 — scripted input record + replay** (`00ef870`). New `src/input_log.{h,cpp}`: `RecordSink` (append-only file) + `ReplaySource` (load-once, drain-per-frame). 14-byte/event format written field-by-field to dodge struct padding. `main.cpp` extended with `Mode::{Live,Record,Replay}` and `--record` / `--replay` CLI flags. Replay forces dt = 1/60 s, makes the window non-resizable so logged pixel coords stay valid, and auto-exits 2 s (120 frames @ 60 Hz) after the last event. Verified end-to-end: 1055-event session captured → replayed → playback visually faithful to recording.
 
-## Next concrete step — FlareLab Phase 2 step 3: capture mode (Sample dump)
+### Session 4 — 2026-05-19
 
-With record/replay closed, the next step is the **capture pipeline**: a `--capture` flag that, while replaying (or live-running) a session, writes `Sample` structs to disk on a sub-sampled cadence. Per DATA_SPEC v0.2 this is every 4th frame, dumped as length-prefixed records into `samples.zst` (zstd-streamed). The Sample's exact field layout is the next design decision — minimally: camera transform, light list, per-fragment GT shadow (rendered by the high-quality renderer landing in step 4), and a frame index.
+**Done**
+- **FlareLab Step 3 — capture mode** (`0b07403`). `--capture <path>` flag writes one 263336-byte Sample (DATA_SPEC v0.2 wire format) every 4th frame to a raw `.bin` (zstd deferred to step 5). New `src/sample_writer.{h,cpp}` owns a 256² depth FBO, blits from default FBO depth via `glBlitFramebuffer`, reads back as f32, packs to f16 with a hand-rolled IEEE binary32→binary16 conversion. Header / light list / depth fields written by-field (no struct padding). Shadow factor field is placeholder zeros until step 4 ships the PCF GT.
+- **`Game::lastView` / `Game::lastProj` exposed** (`ITHappyGame@b9a5bfe`). Mirrored at the top of `Game::render` every frame so SampleWriter can read the per-frame camera/projection without poking into the render path. No behavior change on Android; build verified for arm64-v8a + x86_64.
+- **DATA_SPEC.md fixed**: wire-format size note corrected from 264960 B → 263336 B (the 264960 was a math error; field-by-field correctly sums to 168 + 1024 + 131072 + 131072).
+- **Smoke test passed end-to-end.** Synthetic 2-event replay log (tiny.bin, 28 B) → flarelab.exe `--replay tiny.bin --capture samples_smoke.bin` → 38 samples × 263336 B = 10006768 B exactly, zero remainder. Header fields parse back: `frame_index=0`, UUID matches startup log, view/proj diag matches m4_perspective, `hero_light_pos=(0.05, 1.5, 0)` (player just started moving), `active_light_count=8`, light[0] = warm hero light, light[1] = first seeded colored light. Depth is 95% non-zero bytes (real geometry); shadow_factor is all zeros (placeholder).
+
+## Next concrete step — FlareLab Phase 2 step 4: 4096² PCF cube-shadow GT renderer
+
+The capture pipeline writes `shadow_factor` as placeholder zeros today (step 3). Step 4 fills that field with the high-quality ground truth the Phase-3 visibility predictor learns to imitate. Per DATA_SPEC §2: **4096² depth cube map + 16-sample PCF**, captured as a per-fragment shadow factor in [0,1], downsampled to 256² f16 for storage.
 
 **Design questions to resolve before code:**
-- **Sample schema.** Fixed-size header + variable payload? Cap light count at 32? Quantize the GT shadow buffer (2 MB raw → ~100 KB at 8-bit + zstd)?
-- **Cadence.** Every 4th frame is a starting heuristic; should it be tunable per-session?
-- **Where capture sits relative to replay.** `--replay X --capture Y` (replay drives input, capture dumps samples) is the obvious wiring. Confirm no surprises in the main-loop ordering.
+- **Render-graph placement.** Existing Phase-1 cube-shadow runs at 512² inside `Game::render`. Cleanest is a *second* cube-shadow path that only fires on capture frames (`g_frameIdx % 4 == 0`), uses a 4096² FBO, and writes its sampled per-fragment factor into a 256² FBO that SampleWriter reads back. The Phase-1 512² path stays untouched so the Mali baseline cost numbers don't shift.
+- **PCF kernel choice.** 16-sample stratified Poisson disk vs. fixed 4×4 grid vs. learned sampling pattern? Poisson disk is the conventional pick; 4×4 grid is cheaper but more banding-prone. Probably Poisson.
+- **Where the shadow_factor pass renders.** Need a third FBO sized 256×256 (RGBA8 or R8) that runs a full-screen quad over the captured 256² depth + light list and writes shadow factor per texel. Or: render at the native 1280×720 resolution and downsample (like the depth path).
+- **Cost.** 4096² is 64× the per-face area of the Phase-1 512² map; 6 faces × 4096² is 100M pixels per capture frame. On RTX 4060 Ti this is ~2 ms — fine for offline GT generation, not realtime.
 
-I'll write a tight design doc in chat before any code, per the plan-before-implement rule.
+**Files this will touch:**
+- `ITHappyGame/app/src/main/cpp/game.cpp` and `.h` — likely a new opt-in path or a separate renderer class living next to `Game` (TBD in design).
+- `FlareLab/src/sample_writer.cpp` — call into the high-quality shadow path, read back 256² shadow factor, replace the zeros in the Sample.
 
-**Phase 2 remaining steps:**
-- step 3 (next): capture mode (Sample dump every Nth frame).
-- step 4: 4096² PCF cube-shadow GT renderer.
-- step 5: record 5 input sessions + run capture + compress.
+**Phase 2 remaining steps after this:**
+- step 5: record 5 input sessions + run capture + zstd-compress (`samples.bin` → `samples.zst`, manifest.json).
 
 **Out of scope until later phases:** model architecture (Phase 3), NNAPI/TFLite (Phase 4), eval harness (Phase 5), user study (Phase 6), paper (Phase 7).
 
