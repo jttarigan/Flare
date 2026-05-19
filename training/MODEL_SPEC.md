@@ -38,7 +38,9 @@ Picked U-Net over flat dilated-conv stack and per-light-aggregate because: (a) w
 - **Bottleneck:** 1×1 conv at 128 channels, two depthwise blocks.
 - **Decoder:** 4 up-blocks. Bilinear-resize (NOT transposed conv — better delegate coverage on Hexagon + APU 780 + Exynos NPU) → concat skip → DepthwiseSeparable block.
 - **Head:** 1×1 conv → sigmoid.
-- **Param budget:** target < 500K. MAC budget at 256² input: target < 30M MACs/frame.
+- **Param budget:** target < 500K. **v0.1 actual: 197,649 params** (~40% under, leaves headroom to go wider for quality).
+- **MAC budget:** target < 2.0G MACs / 256² frame. **v0.1 actual: ~1.00G MACs** (revised up from v0.1's optimistic 30M target — even pure depthwise-separable U-Nets at 256² dense prediction sit in the gigamac range. APU 780 sustains ~3 TOPS INT8 in practice → 1G MACs ≈ ~1 ms inference incl. memory traffic, leaves ~1 ms margin on the 2 ms target).
+- **Cost distribution warning:** ~40% of MACs are at full 256² resolution (encoder stage 1 = 189M, decoder stage 1 = 215M). If Phase 4 device-latency measurements overshoot 2 ms, the v0.2 fix is a stride-2 stem (process internal stages at 128², bilinear-up to 256² before the head) — knocks roughly 350M MACs off the budget without touching the bottleneck capacity.
 - **Ops used (all standard NNAPI 1.2+):** `Conv2D`, `DepthwiseConv2D`, `Add`, `Concat`, `BN` (folded at export), `ReLU6`, `ResizeBilinear`, `Logistic` (sigmoid).
 - **Avoided:** GroupNorm, LayerNorm, attention, transposed conv, SiLU/Swish. All known to fall back to CPU on at least one of the three target NPUs.
 
@@ -83,7 +85,8 @@ Within the 4 train sessions: 90/10 random split for early-stopping validation. ~
 | **Quality (INT8)**| SSIM ≥ 0.975 (post-quantization regression < 0.005) | Standard mobile-NN tolerance |
 | **Latency (APU 780, Poco X6 Pro)** | < 2 ms / frame | < 1/3 of the 5.9 ms Mali shadow pre-pass |
 | **Latency (Exynos 1580, Hexagon)** | < 3 ms / frame | Budget margin for cross-device variance |
-| **Parameter count** | < 500K | Disk size, cold-start load time |
+| **Parameter count** | < 500K (v0.1: 198K) | Disk size, cold-start load time |
+| **MAC count / frame** | < 2.0G (v0.1: 1.00G) | Drives latency on APU 780 / Hexagon |
 
 ## 10. Open research risk — captured depth is camera-POV, not light-POV
 
