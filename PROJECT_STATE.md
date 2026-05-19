@@ -5,7 +5,8 @@ Single source of truth for "where is the research right now". Update at the end 
 ## Current position
 
 - **Phase 1 — closed.** Baseline forward N-light shading + hero cube-shadow + per-stage GPU timing all running on Poco X6 Pro.
-- **Phase 2 — closed 2026-05-19.** All 5 steps shipped. Dataset V (5 sessions × 1830 samples) lives under `Flare/training/data/` (gitignored), reproducible from `Flare/training/capture/{generate_sessions.py, run_pipeline.py}` given frozen SHAs `flarelab_sha=608f341 / ithappygame_sha=20256b9`.
+- **Phase 2 — closed 2026-05-20** (Dataset V v2). The 2026-05-19 close was retracted after Phase-3 viz revealed the synthetic generator collapsed all 5 sessions to one scene (see Session 7). Current Dataset V is 5 sessions × 1831 samples driven by a new `--cursor-script` FlareLab mode that writes `Game::cursorPos` directly, bypassing the touch/joystick layer. Frozen SHAs: `flarelab_sha=1281713 / ithappygame_sha=20256b9`.
+- **Phase 3 — in progress.** MODEL_SPEC v0.1.1 (`Flare@cf0d17f`). Model + loss + train + viz scaffold landed (`Flare@5161ea1`, `f1377d6`). First shakedown on the broken Dataset V was misleading (val_ssim 0.937 was memorization). Second shakedown on the fixed Dataset V was launched at end of session 7 and is **still running** when we sign off — read `Flare/training/shakedown.log` to see results when resuming.
 - **Step 1 closed and device-verified** (1a–1d).
 - **Step 2 closed and device-verified.** Point-light cube shadow mapping for the hero light is the GPU baseline the learned visibility predictor (contribution #2) gets benchmarked against in Phase 5.
 - **Step 3 closed and device-verified.** Per-stage GPU timing via `EXT_disjoint_timer_query`. Mali r44p1 quirk: extension is omitted from `glGetString(GL_EXTENSIONS)` but `eglGetProcAddress` still returns working entry points — probe via the entry-point pointers + a `glGenQueriesEXT` smoke test, ignore the extension string.
@@ -21,11 +22,12 @@ Single source of truth for "where is the research right now". Update at the end 
   - `ebdf549` — Flare Step 3 (`EXT_disjoint_timer_query` with 4-slot ring, 3 stages, cyan µs HUD). Probe via `eglGetProcAddress` + smoke test, not the extension string (Mali quirk).
   - `15b8170` — Add `platform.h` shim (FlareLab enabler). Android build bit-identical; on desktop, shim provides AAssetManager/AAsset over fopen + GLEW in place of GLES3 headers.
 
-- **FlareLab/ commits** (separate local repo, sibling to `ITHappyGame/`):
+- **FlareLab/ commits** (separate local repo, sibling to `ITHappyGame/`; no git remote — see memory `reference_flarelab_local_only`):
   - `0b4007a` — Phase 2 step 1 desktop port scaffold. GLFW + GL 3.3 + GLEW. Shares game.cpp/gltf_model.cpp via CMake source references. Renders the full Phase-1 scene on desktop (RTX 4060 Ti).
   - `00ef870` — Phase 2 step 2 scripted input record + replay. `--record <path>` / `--replay <path>` CLI; 14-byte/event binary log (u32 frame, u8 type, u8 id, f32 x, f32 y) written field-by-field. Replay forces dt=1/60, non-resizable window, 2 s grace after last event. Verified: 1055-event session replayed faithfully.
   - `0b07403` — Phase 2 step 3 capture mode. `--capture <path>` writes one 263336-byte Sample (DATA_SPEC v0.2 wire format) every 4th frame. 256² depth captured via `glBlitFramebuffer` from default FBO → 256² capture FBO → readback → hand-rolled f32→f16. Shadow factor is placeholder zeros until step 4. Smoke test: 38 samples × 263336 B exactly.
   - `608f341` — Phase 2 step 4 PCF shadow GT resolver. New `src/pcf_resolver.{h,cpp}`: 256² R16F FBO + full-screen-quad GLSL doing 16-sample Poisson disk PCF over `Game::hqShadowCubeTex`. Reconstructs world pos from captured depth via inverse VP. SampleWriter swaps step-3's placeholder zeros for real PCF. `main.cpp` gates `wantsHqShadow` on capture cadence so HQ cast only fires on actual sample frames.
+  - `1281713` — `--cursor-script` mode (Session 7 rescue). New `src/cursor_script.{h,cpp}` reads a per-frame world-space `(x, z)` binary script and writes `Game::cursorPos` directly each frame. Skips touch/joystick handling entirely. Wire format: `u32 frame_count` + `N × (f32 x, f32 z)`. `--record` and `--replay` paths preserved for human sessions in Phase 5.
 
 - **Dataset V (Phase 2 step 5 output)** at `Flare/training/data/` (gitignored, reproducible):
   - 5 × `session_0{1..5}_{idle,slow,chase,scrum,empty}/{samples.zst, meta.json}`. Per session: 1830 samples × 263336 B = 481.9 MB raw → ~4.8 MB zstd-1 (~1% ratio). Total compressed corpus: ~24 MB.
@@ -120,6 +122,36 @@ Session ended abruptly when the PC powered off mid-AFK (suspected mains glitch).
 - The original Step-5 spec called for 5 **human `--record`** sessions. What landed instead is 5 **synthetic deterministic** trajectories. The trade is: reproducibility-first (frozen-seed scripts regenerate the same dataset given the frozen SHAs) at the cost of input-distribution realism (real human gameplay has bursty trajectories, click clusters, hesitation; the Gaussian-jittered parametric curves don't model that).
 - For Phase 3 model training this is probably fine — the visibility predictor sees `(depth, light list) → shadow factor` and shouldn't care how the camera got where it is.
 - For Phase 5 evaluation / Phase 6 user study, an additional `--record`-sourced corpus may need to be layered on top so the evaluation distribution matches actual gameplay. Decision deferred to start of Phase 5.
+
+### Session 7 — 2026-05-19 → 2026-05-20
+
+**The arc:** built Phase-3 dataset loader + model + loss + training scaffold; first shakedown looked great; viz mosaic check revealed the dataset was degenerate; rescued by writing a new FlareLab input path and regenerating Dataset V; second shakedown launched, not yet done at sign-off.
+
+**Done — Phase 3 build-out**
+- `Flare/training/dataset.py` + `smoke_dataset.py` (`Flare@dfe7db6`). Decodes DATA_SPEC v0.2 zstd shards into 9-channel input tensors (world_pos + linear_eye_z + hero-light-relative geometry + valid_mask) + 1-channel shadow target. Numpy-only parse path so it's usable without torch. Smoke test exposed that raw GL window depth has zero dynamic range (zfar/znear ≈ 1000:1 packs into [0.989, 1.000]); fix is to linearize via projection-matrix-extracted (znear, zfar). Also added validity mask for ~14% far-clip background pixels per frame.
+- `Flare/training/model.py` + `loss.py` + `train.py` (`Flare@5161ea1`). Lightweight U-Net (197,649 params, 1.0G MACs at 256² — MODEL_SPEC §4/§9 revised, the original `<30M MACs` budget was off by ~30×). Masked + class-weighted L1 (lit:hard = 1:3) + masked Sobel-gradient L1 (weight 0.3). Masked SSIM helper for val. AdamW + cosine LR + fp16 AMP + horizontal-flip augmentation (negates world-x + delta-x channels).
+- `smoke_overfit.py` (`Flare@f1377d6`). Standard architecture-validation diagnostic: 80 iters on a fixed 8-sample batch drives masked-L1 from 0.51 → 0.033 (below naive 0.067 baseline) and SSIM from 0.65 → 0.94. Confirms gradient flow.
+- First **5-epoch shakedown** on the v1 Dataset V completed in 6.7 min. Numbers looked promising: best val_l1 = 0.0635, val_ssim = 0.937 at epoch 4.
+
+**Done — the bug & the rescue**
+- `viz_predictions.py` rendered 4-panel mosaics (depth | GT | pred | abs-diff) for 5 samples each from "seen" (session_01_idle) and "unseen" (session_05_empty). Both PNGs were **byte-identical** (md5 confirmed). Investigation: hero positions also identical across all 5 sessions despite distinct input logs.
+- Root cause traced through `game.cpp:1609-1644`: virtual joystick activates only on left half of screen, and requires `joystickMag > 0.15` (≈18 px deflection from Down) to move the cursor. The v1 synthetic generator emitted touch events that either landed on the right half (no joystick) or jittered with Gaussian σ=2-4 (sub-threshold deflection). **All 5 sessions produced zero joystick-driven cursor motion.** Hero light moved only via squad AI drift, identically. Dataset V was one scene captured 9150 times. Shakedown val_l1 0.0635 was memorization (train + val both pulled from the same one scene).
+- **Methodology fix:** `FlareLab@1281713` adds `--cursor-script <path>` mode that writes `Game::cursorPos` directly each frame, bypassing the input layer. Generator rewritten to emit world-space cursor trajectories: idle parked at origin, slow figure-8, chase circle r=2.5, scrum near enemy at (2.5, 0.3), empty parked at (-2.5, -1.5). Recapture in `Flare@760589d` produced 5 × 1831 samples with diverse compression ratios (1.1%–1.5%) and end-frame hero positions spanning (-2.5, -1.5) to (+2.77, -0.56) — real diversity now.
+- Lessons captured to memory: `feedback_synthetic_data_bypass_inputs`, `feedback_viz_diagnostic_catches_bugs_metrics_cant`.
+
+**Status at sign-off**
+- Code: all committed and pushed to origin/main. Flare HEAD = `760589d`.
+- Data: Dataset V v2 sits under `Flare/training/data/session_0{1..5}_*/` (gitignored).
+- Training: **second 5-epoch shakedown is running in the background** (PID `ba2vbxuzt`, output → `Flare/training/shakedown.log`). At sign-off only epoch 1 was done (val_l1 0.1675, val_ssim 0.827). Should finish ~5 min after sign-off; results will be in the log file.
+
+## Next concrete step — read `shakedown.log`, decide on the 100-epoch run
+
+When resuming:
+
+1. **Read `Flare/training/shakedown.log`** — confirm the run completed (look for "done in X.X min. best val_l1 = …" at the end) and inspect the per-epoch numbers. Expected: train_l1 + val_l1 monotonically decreasing, val_ssim climbing. Likely *lower* SSIM than the broken-data shakedown's 0.937 — that one was memorization-inflated; real generalization on diverse scenes will start lower.
+2. **Re-render viz mosaics** from the new `best.pt`: `python viz_predictions.py --ckpt checkpoints_shake/best.pt --out-prefix viz_shake_v2`. This time `seen` and `unseen` PNGs should differ visually (different hero positions, different shadow shapes).
+3. **Decide on the 100-epoch full run.** If shakedown numbers look reasonable (val_ssim climbing past 0.85 by epoch 4, no NaN/Inf): kick it off in background, ~2.2 hr wall. If the network struggles on the real data: revisit MODEL_SPEC §5 loss weighting and/or §4 architecture before sinking that GPU time.
+4. **Push checkpoints?** Decide whether to start tracking `best.pt` somewhere (gitignored today; LFS or external storage if we want reproducibility across machines).
 
 ## Next concrete step — Phase 3 kickoff: visibility predictor model architecture
 
