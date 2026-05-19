@@ -14,3 +14,7 @@ training/checkpoints/
 eval/runs/
 *.onnx
 *.tflite
+
+# Python bytecode
+__pycache__/
+*.pyc

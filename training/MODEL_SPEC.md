@@ -1,4 +1,8 @@
-# MODEL_SPEC — Visibility Predictor (Phase 3, draft v0.1)
+# MODEL_SPEC — Visibility Predictor (Phase 3, draft v0.1.1)
+
+> **v0.1.1 changes (smoke-test findings, see §10.1):** input grew to 9 channels
+> (linearized eye-space z replaces raw window depth + validity mask added);
+> §5 loss is masked + class-weighted to handle the 94/4.5/1.9 class imbalance.
 
 Best-guess design draft for the **learned visibility predictor** (research contribution #2). Replaces the 5.9 ms Mali cube-shadow pre-pass with NPU inference. **Quality target: tight to the 4096² PCF GT.** **Latency target: < 2 ms on Poco X6 Pro APU 780.** Implementation is gated on a planning round before code lands.
 
@@ -9,16 +13,17 @@ Given a per-frame camera-space depth field and the hero light position, predict 
 - Single-light scope. The seven static colored lights stay unshadowed in the baseline (per Phase-1 decision); the predictor targets the hero light only.
 - Per-frame inference. No temporal accumulation in v0.1 (defer to v0.2 if quality regresses on motion-heavy sessions).
 
-## 2. Inputs (256² × 8 channels)
+## 2. Inputs (256² × 9 channels)
 
 Assembled by the data-loader from the captured Sample. **The wire format does not change** — everything is derived from the existing DATA_SPEC v0.2 fields.
 
 | Channels | Source | Notes |
 |---|---|---|
-| 3 | `world_pos = invVP · ndc(depth)` | Reconstructed per-pixel in the data-loader. Cheap matrix mul; no inference-time cost. |
-| 1 | `depth_f16` | The captured eye-space depth, passed through as-is. |
-| 3 | `(hero_light_pos − world_pos)` broadcast | Per-pixel vector to the hero light. Encodes the "ray we'd shoot at the shadow map" geometrically. |
-| 1 | `1 / max(ε, length(hero_light_pos − world_pos))` | Inverse distance. Helps the network learn falloff-correlated occlusion patterns cheaply. |
+| 3 | `world_pos = invVP · ndc(depth)` | Reconstructed per-pixel. Zeroed on background pixels (see ch 8) so the network doesn't see far-plane outliers. |
+| 1 | `linear_eye_z / 50` (clipped to [0, 1]) | Eye-space z, derived from captured window depth + extracted (znear, zfar) from the projection matrix. **Raw window depth is unusable** — the scene's zfar/znear ≈ 1000:1 packs all real geometry into window-depth [0.989, 1.000]. Linearization restores dynamic range to ~[0.17, 0.26] on valid pixels. |
+| 3 | `(hero_light_pos − world_pos)` | Per-pixel vector toward hero light. Encodes the shadow-ray geometry. Zeroed on background. |
+| 1 | `1 / max(ε, ‖hero_light_pos − world_pos‖)` | Inverse distance. Cheap falloff-correlated occlusion signal. Zeroed on background. |
+| 1 | `valid_mask = (depth < 0.9995)` | 1 where pixel hit real geometry, 0 at far-clip background. The captured 256² spans the full screen, so ~14% of pixels are background — the network is told explicitly. |
 
 ## 3. Output (256² × 1 channel)
 
@@ -39,8 +44,9 @@ Picked U-Net over flat dilated-conv stack and per-light-aggregate because: (a) w
 
 ## 5. Loss
 
-- **L1 on shadow factor** (primary). f16 GT, f32 prediction.
-- **L1 on Sobel gradient of shadow factor** (weight 0.3). Drives edge sharpness explicitly — the perceptual axis that distinguishes "good" shadow approximations from "blurry blob" failure modes.
+- **Masked L1 on shadow factor** (primary). Computed only over `valid_mask == 1` pixels — background carries no shadow signal and isn't part of the perceptual task. f16 GT, f32 prediction.
+- **Class-weighted scaling.** On-platform pixel distribution is **~93.7% lit / 4.5% shadowed / 1.9% penumbra** (measured across `session_01_idle`, 1830 samples). Naive unweighted L1 lets the network collapse to "output 1 everywhere" for L1 ≈ 0.06. Mitigation: weight shadowed (≤0.05) and penumbra (0.05–0.95) pixels at **3×** lit-pixel weight in the loss reduction. Re-evaluate after first training run; switch to focal loss if collapse persists.
+- **Masked L1 on Sobel gradient** (weight 0.3). Drives shadow-edge sharpness — the perceptual axis that distinguishes "good" shadow approximations from "blurry blob" failure modes. Gradient computed before masking, then the gradient itself is masked.
 - **No perceptual loss in v0.1.** SSIM is the evaluation metric, not the training metric, to avoid optimizing on the validator.
 
 ## 6. Train / val / test split
@@ -84,6 +90,16 @@ Within the 4 train sessions: 90/10 random split for early-stopping validation. ~
 The network has to infer the geometry between the receiver point and the hero light from a top-down camera depth image. The platform is flat, occluders are 4 skinned characters + 1 boss enemy with known general locations, and the hero light tracks the player — so the space of "what could occlude" is small and learnable. Published mobile neural-shadow work succeeds with similar setups.
 
 **But if v0.1 bottoms out below SSIM 0.95**, the likely fix is to extend DATA_SPEC to include a low-res (64² × 6 faces ≈ 25 KB) cube shadow depth as additional input. That would invalidate Dataset V and require re-capture. Fallback plan, not a v0.1 plan.
+
+## 10.1 Smoke-test findings (v0.1.1 pivot)
+
+`Flare/training/smoke_dataset.py` parsed all 1830 samples of `session_01_idle` and exposed two issues with the v0.1 input plan:
+
+1. **Captured depth has no usable dynamic range.** Projection matrix decode shows zfar/znear ≈ 1000:1. All real-scene pixels sit in window-depth `[0.989, 1.000]`. Feeding raw depth to the network would give it near-constant signal. **Fix:** linearize to eye-space z (channel 3 in v0.1.1) using `(znear, zfar)` extracted per-sample from `proj[2,2]` / `proj[2,3]`. On valid pixels the resulting normalized channel has range `[0.17, 0.26]` — proper variance.
+2. **~14% of every captured frame is far-clip background** (off-platform sky region). World-pos reconstruction for those pixels blows up to ±80 units (far plane). Without explicit signalling the network would learn the degenerate "if `world.y < -10` output `1`" rule and bypass the actual visibility problem. **Fix:** add channel 8 `valid_mask`, zero out world / delta / inv_dist on background pixels, mask the training loss.
+3. **Even with masking, on-platform classes are skewed 94/4.5/1.9.** Shadowed and penumbra pixels are rare. Loss must be class-weighted or focal; tracked in §5.
+
+These are encoding / loss issues, not architectural or wire-format issues. Dataset V stays frozen.
 
 ## 11. Implementation gate
 
