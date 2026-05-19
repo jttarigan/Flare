@@ -10,7 +10,8 @@ Thumbs.db
 
 # Future Flare additions
 training/data/
-training/checkpoints/
+training/checkpoints*/
+training/*.log
 eval/runs/
 *.onnx
 *.tflite

@@ -32,7 +32,7 @@ REPO_ROOT = os.path.normpath(
 )
 FLARELAB_DIR     = os.path.join(REPO_ROOT, "FlareLab")
 FLARELAB_EXE     = os.path.join(FLARELAB_DIR, "build", "Release", "flarelab.exe")
-SESSIONS_DIR     = os.path.join(FLARELAB_DIR, "sessions")
+SESSIONS_DIR     = os.path.join(FLARELAB_DIR, "cursor_scripts")
 ITHAPPYGAME_DIR  = os.path.join(REPO_ROOT, "ITHappyGame")
 OUT_BASE         = os.path.join(REPO_ROOT, "Flare", "training", "data")
 TMP_DIR          = os.path.join(REPO_ROOT, "FlareLab", "build", "capture_tmp")
@@ -83,9 +83,9 @@ def run_capture(input_bin, output_samples_bin):
     if os.path.exists(output_samples_bin):
         os.remove(output_samples_bin)
     cmd = [FLARELAB_EXE,
-           "--replay",  input_bin,
-           "--capture", output_samples_bin]
-    print(f"    $ flarelab --replay {os.path.basename(input_bin)} --capture {os.path.basename(output_samples_bin)}")
+           "--cursor-script", input_bin,
+           "--capture",       output_samples_bin]
+    print(f"    $ flarelab --cursor-script {os.path.basename(input_bin)} --capture {os.path.basename(output_samples_bin)}")
     t0 = time.time()
     result = subprocess.run(cmd, cwd=FLARELAB_DIR)
     dt = time.time() - t0
